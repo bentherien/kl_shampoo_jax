@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kl-shampoo-jax"
+version = "0.1.0"
+description = "KL-Shampoo optimizer for JAX/optax (Lin et al., arXiv:2509.03378)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Benjamin Therien", email = "benjtherien@gmail.com" },
+]
+keywords = ["jax", "optax", "optimizer", "shampoo", "kl-divergence"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jax>=0.4.30",
+    "optax>=0.2.2",
+    "chex>=0.1.85",
+    "flax>=0.8.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",
+    # torch is optional; tests that need it are skipped if unavailable.
+    "torch>=2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/bentherien/kl_shampoo_jax"
+Paper = "https://arxiv.org/abs/2509.03378"
+Reference = "https://github.com/yorkerlin/KL-Methods"
+
+[tool.setuptools.packages.find]
+include = ["kl_shampoo_jax*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
