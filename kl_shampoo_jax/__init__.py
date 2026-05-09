@@ -21,4 +21,4 @@ from kl_shampoo_jax._core import KLShampooState, kl_shampoo
 from kl_shampoo_jax._routing import kl_shampoo_with_adamw, param_labels
 
 __all__ = ["kl_shampoo", "KLShampooState", "kl_shampoo_with_adamw", "param_labels"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -87,6 +87,84 @@ def test_per_leg_weight_decay():
     np.testing.assert_allclose(np.asarray(updates["b"]), np.zeros_like(np.asarray(params["b"])), atol=1e-5)
 
 
+def test_per_leaf_eps_scale_isolates_kl_leg():
+    """Verify that kl_eps_scale per-leaf multipliers change the KL update for
+    the KL-routed leaves. Adam leaves are passed through `kl_shampoo` as-is
+    (no eps used) so their update is unaffected by `kl_eps_scale`.
+
+    Strategy: build two optimizers with eps_scale={"W": 1.0} and {"W": 1e6}
+    on the same KL leaf; the second one drives the preconditioner damping
+    `1 / (1 + scale * eps)` to ~0, so the KL-leg update should shrink toward 0.
+    """
+    import numpy as np
+    from kl_shampoo_jax import kl_shampoo, kl_shampoo_with_adamw
+
+    rng = np.random.default_rng(0)
+    params = {
+        "W": jnp.asarray(rng.standard_normal((8, 16)).astype(np.float32)),
+        "b": jnp.asarray(rng.standard_normal((16,)).astype(np.float32)),
+    }
+    g = jax.tree_util.tree_map(lambda x: jnp.asarray(rng.standard_normal(x.shape).astype(np.float32)), params)
+
+    common = dict(b1=0.0, shampoo_b=0.5, cast_dtype=jnp.float32, eigh_dtype=jnp.float32)
+    opt_small = kl_shampoo_with_adamw(
+        learning_rate=1.0,
+        kl_kwargs={**common, "eps": 1e-8},
+        adamw_kwargs=dict(b1=0.0, b2=0.0, eps=1.0),
+        weight_decay=0.0,
+        kl_eps_scale={"W": jnp.float32(1.0), "b": jnp.float32(1.0)},
+    )
+    opt_huge = kl_shampoo_with_adamw(
+        learning_rate=1.0,
+        kl_kwargs={**common, "eps": 1e-8},
+        adamw_kwargs=dict(b1=0.0, b2=0.0, eps=1.0),
+        weight_decay=0.0,
+        kl_eps_scale={"W": jnp.float32(1e10), "b": jnp.float32(1.0)},
+    )
+    s_small = opt_small.init(params)
+    s_huge = opt_huge.init(params)
+
+    # Drive past the first iter (which always returns 0). Run two steps.
+    upd_small, s_small = opt_small.update(g, s_small, params)
+    upd_small, s_small = opt_small.update(g, s_small, params)
+    upd_huge, s_huge = opt_huge.update(g, s_huge, params)
+    upd_huge, s_huge = opt_huge.update(g, s_huge, params)
+
+    # KL leaf "W": effective eps is much larger in opt_huge → preconditioner
+    # damping `1/(1 + scale * eps_huge)` shrinks to ~0 → update for W → 0.
+    kl_norm_small = float(jnp.linalg.norm(upd_small["W"]))
+    kl_norm_huge = float(jnp.linalg.norm(upd_huge["W"]))
+    assert kl_norm_huge < 0.05 * kl_norm_small, (
+        f"large eps_scale should shrink KL update; "
+        f"small={kl_norm_small:.4e}, huge={kl_norm_huge:.4e}"
+    )
+
+    # Adam leaf "b": eps_scale is 1.0 in both — update should match exactly.
+    np.testing.assert_allclose(
+        np.asarray(upd_small["b"]), np.asarray(upd_huge["b"]), atol=1e-6,
+    )
+
+
+def test_eps_scale_none_is_backward_compatible():
+    """Verify that omitting eps_scale gives identical updates to the v0.2.0
+    behavior (scalar eps applied uniformly)."""
+    import numpy as np
+    from kl_shampoo_jax import kl_shampoo
+
+    rng = np.random.default_rng(0)
+    params = {"W": jnp.asarray(rng.standard_normal((6, 8)).astype(np.float32))}
+    g = {"W": jnp.asarray(rng.standard_normal((6, 8)).astype(np.float32))}
+
+    opt_default = kl_shampoo(eps=1e-7, cast_dtype=jnp.float32, eigh_dtype=jnp.float32)
+    opt_explicit = kl_shampoo(eps=1e-7, eps_scale=None, cast_dtype=jnp.float32, eigh_dtype=jnp.float32)
+    s_default = opt_default.init(params)
+    s_explicit = opt_explicit.init(params)
+    for _ in range(3):
+        u_d, s_default = opt_default.update(g, s_default, params)
+        u_e, s_explicit = opt_explicit.update(g, s_explicit, params)
+    np.testing.assert_allclose(np.asarray(u_d["W"]), np.asarray(u_e["W"]), atol=1e-7)
+
+
 def test_adam_lr_scale_isolates_adam_leg():
     """Verify adam_lr_scale only affects the Adam leg, not the KL leg."""
     import numpy as np

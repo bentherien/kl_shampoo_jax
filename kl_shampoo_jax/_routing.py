@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+import chex
 import jax
 import jax.numpy as jnp
 import optax
@@ -49,6 +50,7 @@ def kl_shampoo_with_adamw(
     weight_decay: float = 0.01,
     adam_weight_decay: Optional[float] = None,
     adam_lr_scale: float = 1.0,
+    kl_eps_scale: Optional[chex.ArrayTree] = None,
     max_precond_dim: int = 8192,
 ) -> optax.GradientTransformation:
     """KL-Shampoo on 2D/3D in-range matrices, AdamW on the rest.
@@ -74,6 +76,9 @@ def kl_shampoo_with_adamw(
       adam_lr_scale: multiplicative LR scale applied to the AdamW leg only.
         Useful when KL-Shampoo's optimal LR is much higher than the AdamW
         leg's optimum (KL is matrix-preconditioned; AdamW is sign-magnitude).
+      kl_eps_scale: optional pytree of per-leaf eps multipliers (matching the
+        full param tree). Forwarded to `kl_shampoo(eps_scale=...)`. Adam leg
+        leaves are ignored by `kl_shampoo` (passthrough). Used by μCompletedP.
       max_precond_dim: KL leg routes only tensors with `max(shape) <= this`.
     """
     kl_kwargs = dict(kl_kwargs or {})
@@ -83,6 +88,8 @@ def kl_shampoo_with_adamw(
     kl_kwargs.pop("learning_rate", None)
     adamw_kwargs.pop("learning_rate", None)
     adamw_kwargs.pop("weight_decay", None)
+    if kl_eps_scale is not None:
+        kl_kwargs["eps_scale"] = kl_eps_scale
 
     if adam_weight_decay is None:
         # Legacy: single chain-level WD applied uniformly across both legs.

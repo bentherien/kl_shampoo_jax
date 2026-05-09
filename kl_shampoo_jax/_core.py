@@ -11,7 +11,7 @@ optax.scale_by_learning_rate(lr))`.
 """
 from __future__ import annotations
 
-from typing import NamedTuple, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import chex
 import flax.struct as fstruct
@@ -46,6 +46,16 @@ def _is_per_param_state(x):
 
 def _is_step_out(x):
     return isinstance(x, _StepOut)
+
+
+def _is_masked(x):
+    """True for `optax.MaskedNode` placeholders, regardless of optax version.
+
+    `optax.multi_transform` masks non-matching leaves with a MaskedNode (an
+    empty NamedTuple) before calling each inner transform's `update_fn`. We
+    treat it as a leaf so we can propagate it correctly through tree_map.
+    """
+    return type(x).__name__ == "MaskedNode"
 
 
 def _supported_rank(p) -> bool:
@@ -154,7 +164,7 @@ def _step_2d(grad, st, hp):
 
         # 3) Kronecker scaling by esi_0 ⊗ esi_1, with damping
         scale = st.eigen_sqrt_inv[0][:, None] * st.eigen_sqrt_inv[1][None, :]
-        scale = scale / (1.0 + scale * hp["eps"])
+        scale = scale / (1.0 + scale * jnp.asarray(hp["eps"], scale.dtype))
         precond = proj * scale
 
         # 4) project back: Q0 precond Q1^T
@@ -257,7 +267,7 @@ def _step_3d(grad, st, hp):
         scale = (st.eigen_sqrt_inv[0][:, None, None]
                  * st.eigen_sqrt_inv[1][None, :, None]
                  * st.eigen_sqrt_inv[2][None, None, :])
-        scale = scale / (1.0 + scale * hp["eps"])
+        scale = scale / (1.0 + scale * jnp.asarray(hp["eps"], scale.dtype))
         precond = proj * scale
 
         # 4) project back
@@ -354,6 +364,7 @@ def kl_shampoo(
     b1: float = 0.9,
     shampoo_b: float = 0.98,
     eps: float = 1e-8,
+    eps_scale: Optional[chex.ArrayTree] = None,
     precondition_frequency: int = 10,
     init_factor: float = 0.1,
     max_clamp_value: int = 4000,
@@ -371,11 +382,17 @@ def kl_shampoo(
     Only 2D and 3D leaves are preconditioned. Other ranks are passed through
     unchanged (cast to `cast_dtype`); use `optax.multi_transform` to route them
     to AdamW or another optimizer.
+
+    Args:
+      eps_scale: optional pytree of per-leaf eps multipliers (same structure as
+        the params). If provided, the effective per-leaf eps is `eps * eps_scale`.
+        Useful for μCompletedP-style per-tensor scaling. If None (default),
+        the scalar `eps` is broadcast uniformly across all leaves.
     """
     del learning_rate  # accepted for parity with optax.adamw signature; unused
 
-    hp = dict(
-        b1=b1, shampoo_b=shampoo_b, eps=eps,
+    base_hp = dict(
+        b1=b1, shampoo_b=shampoo_b,
         precondition_frequency=precondition_frequency,
         init_factor=init_factor,
         max_clamp_value=max_clamp_value, using_clamping=using_clamping,
@@ -389,7 +406,27 @@ def kl_shampoo(
     def update_fn(updates, state, params=None):
         del params  # we work from updates' shapes/ranks
 
-        def _per_leaf(g, st):
+        # Build a per-leaf effective eps tree whose treedef MATCHES `updates`.
+        # When this transform is wrapped by `optax.multi_transform`, `updates`
+        # contains MaskedNode placeholders at non-KL positions; `eps_scale`
+        # (captured at factory time) does not. We zip them through tree_map
+        # with `is_leaf=_is_masked` so MaskedNodes terminate traversal.
+        if eps_scale is None:
+            eps_tree = jax.tree_util.tree_map(
+                lambda u: u if _is_masked(u) else jnp.asarray(eps, eigh_dtype),
+                updates,
+                is_leaf=_is_masked,
+            )
+        else:
+            eps_tree = jax.tree_util.tree_map(
+                lambda u, s: u if _is_masked(u)
+                else jnp.asarray(eps, eigh_dtype) * jnp.asarray(s, eigh_dtype),
+                updates, eps_scale,
+                is_leaf=_is_masked,
+            )
+
+        def _per_leaf(g, st, leaf_eps):
+            hp = {**base_hp, "eps": leaf_eps}
             if not _supported_rank(g):
                 return _StepOut(state=st, update=_step_passthrough(g, st, hp)[1])
             if g.ndim == 2:
@@ -401,7 +438,7 @@ def kl_shampoo(
             return _StepOut(state=new_st, update=upd.astype(g.dtype))
 
         pairs = jax.tree_util.tree_map(
-            _per_leaf, updates, state.inner,
+            _per_leaf, updates, state.inner, eps_tree,
             is_leaf=_is_per_param_state,
         )
         new_inner = jax.tree_util.tree_map(
