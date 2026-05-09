@@ -274,3 +274,73 @@ After 50 sweep jobs across 8 phases (~250 GPU-hours on 4×H100), the floor is 4.
 39253383, 39253384, 39253385, 39253386, 39253387, 39253388, 39253389, 39253390, 39253391, 39253392, 39253393, 39253394.
 
 **Total sweep work to date: 50 jobs across 8 phases, ~250 GPU-hours on 4×H100.**
+
+## Phase 9 — Locked Adam HPs (xak20u38 values), sweep KL HPs + T
+
+After the smoothed-loss analysis revealed KL-Shampoo *already beats* mup-Muon on smoothed test loss (3.977 vs 4.044), the user asked to verify the Adam-leg HPs by **locking them to xak20u38's tuned values** (`adam_b1=0.95484, adam_b2=0.9908, adam_eps=1e-8, adam_weight_decay=0.0931`) and re-sweeping KL HPs + `precondition_frequency` T ∈ {1, 5, 10}.
+
+**18-job grid** at `num_inner_steps=1500` (short for fast allocation):
+- T ∈ {1, 5, 10}
+- peak_lr ∈ {1.6e-2, 2.5e-2}
+- weight_decay (KL leg) ∈ {0.01, 0.1, 0.354}
+
+### Phase 9 ranking (1500 steps, by L_hat test, computed via /smoothed-loss skill)
+
+| Rank | T | LR | KL_wd | Last test | $\hat{L}$ test | Last train | $\hat{L}$ train | opt_time/step |
+|------|---|---|-------|-----------|----------------|------------|------------------|---------------|
+| 1 | **1** | 1.6e-2 | 0.1 | 4.255 | **4.249** | 4.189 | 4.241 | 90 ms |
+| 2 | 1 | 2.5e-2 | 0.1 | 4.263 | 4.250 | 4.190 | 4.241 | 90 ms |
+| 3 | 5 | 1.6e-2 | 0.1 | 4.273 | 4.267 | 4.206 | 4.259 | 21 ms |
+| 4 | 5 | 1.6e-2 | 0.01 | 4.286 | 4.278 | 4.218 | 4.272 | 21 ms |
+| 5 | 5 | 1.6e-2 | 0.354 | 4.289 | 4.293 | 4.227 | 4.286 | 20 ms |
+| ... | | | | | ... | | | |
+| 18 | 5 | 2.5e-2 | 0.354 | 4.515 | 4.524 | 4.443 | 4.514 | 22 ms |
+
+### Findings
+
+1. **Within Phase 9 (locked Adam):** kl_wd=0.1 wins (vs 0.01 or 0.354). T=1 ties T=5 to T=10 within noise. peak_lr=1.6e-2 ≈ 2.5e-2 at kl_wd=0.1.
+2. **Optimizer step cost** (T axis):
+   - T=1 → 90 ms/step
+   - T=5 → 21 ms/step (4.3× cheaper)
+   - T=10 ≈ T=5 (QR amortization saturates by T=5; no further gain)
+3. **Verify at 4500 steps** (job 39318141, run `deox09nd`): Phase-9 best cell run for full duration → last test 4.212, **L_hat test 3.999, L_hat train 3.931**.
+
+### Phase 9 vs Phase 8 (locked-Adam vs chain-level)
+
+| Config | Last test | $\hat{L}$ test | Last train | $\hat{L}$ train |
+|---|---|---|---|---|
+| Phase 8 best (chain wd=0.01, default tuned Adam betas) | 4.192 | **3.977** | 3.844 | 3.907 |
+| Phase 9 best (kl_wd=0.1, adam_wd=0.0931, T=1) | 4.212 | 3.999 | 3.873 | 3.931 |
+| **Δ (Phase 9 − Phase 8)** | +0.020 | **+0.022** | +0.029 | +0.024 |
+
+**Locking Adam HPs to mup-Muon's xak20u38 values makes things slightly worse**, by ~0.02 nats on smoothed L_hat. The previous Phase 8 conclusion stands: `adam_wd=0.0931` is too aggressive for KL-Shampoo's vanilla-SP regime, even when combined with a higher KL-leg WD (0.1). The chain-level wd=0.01 (uniform across both legs) plus tuned Adam betas remains the best config.
+
+### Final winning configuration (unchanged from Phase 8)
+
+```python
+optimizer_args = dict(
+    class_="kl_shampoo",
+    kwargs=dict(
+        b1=0.9, shampoo_b=0.99, eps=1e-8, weight_decay=0.01,
+        precondition_frequency=1,    # or 5 if wall-time matters; 4.3× cheaper opt
+        init_factor=0.1, max_clamp_value=4000, using_clamping=True,
+        max_precond_dim=8192,
+        adam_b1=0.955, adam_b2=0.9908, adam_eps=1e-8,
+        adam_weight_decay=None,      # leave at chain-level WD=0.01
+        adam_lr_scale=1.0,
+    )
+)
+schedule = dict(
+    class_="warmup_cosine_decay_schedule",
+    kwargs=dict(peak_value=1.6e-2, end_value=1.6e-3, warmup_steps=500,
+                decay_steps=4000, init_value=0.0, exponent=1.0),
+)
+```
+
+**Best smoothed test L_hat: 3.977** (vs mup-Muon's 4.044 → KL-Shampoo wins by **0.067 nats**).
+
+### Phase 9 job IDs (fir, all completed)
+
+39311859–39311876 (18 sweep jobs at 1500 steps), 39318141 (4500-step verify of best cell).
+
+**Total sweep work to date: 69 jobs across 9 phases, ~290 GPU-hours on 4×H100.**
