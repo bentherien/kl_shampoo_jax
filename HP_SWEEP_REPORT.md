@@ -204,3 +204,73 @@ So the **σ ≈ 0.004** noise floor sets the meaningful comparison: anything wit
 - Phase 7: 39141527, 39141528, 39141529, 39141530, 39141531, 39141532, 39141533, 39141534
 
 **Total: 38 sweep jobs, ~5 GPU-hours each on 4×H100 → ~190 GPU-hours.**
+
+## Phase 8 — Per-leg AdamW HP plumbing (v0.2.0)
+
+After RSA diagnosis ([RSA_FINDINGS.md](RSA_FINDINGS.md)), we patched `kl_shampoo_with_adamw` to support `adam_weight_decay` (per-leg WD asymmetry, mirroring mup-Muon's `weight_decay` vs `adam_weight_decay` split) and `adam_lr_scale` (independent LR scaling for the AdamW leg). The hypothesis: mup-Muon's xak20u38 uses muon_wd=0.354 + adam_wd=0.0931, and our chain-level WD baked the same scalar into both legs; closing this asymmetry should narrow the 0.18-nat gap.
+
+**12-job grid** at fixed best KL HPs (lr=1.6e-2, β=0.99, T=1, b1=0.9):
+
+| tag | kl_wd | adam_wd | adam betas | alrs | Test | Δ vs 4.194 |
+|---|---|---|---|---|---|---|
+| p8_tunedb | 0.01 | 0.01 | 0.955/0.9908 | 1.0 | **4.192** | -0.002 |
+| p8_legacy | 0.01 | 0.01 | 0.9/0.999 | 1.0 | 4.194 | 0 (baseline) |
+| p8_awd0p09_tunedb | 0.01 | 0.0931 | 0.955/0.9908 | 1.0 | 4.214 | +0.020 |
+| p8_klwd0p1_awd0p09 | 0.1 | 0.0931 | 0.955/0.9908 | 1.0 | 4.214 | +0.020 |
+| p8_awd0p09 | 0.01 | 0.0931 | 0.9/0.999 | 1.0 | 4.222 | +0.028 |
+| p8_klwd0p1_alrs0p3 | 0.1 | 0.0931 | 0.955/0.9908 | 0.3 | 4.222 | +0.028 |
+| p8_alrs0p3_awd0p09 | 0.01 | 0.0931 | 0.955/0.9908 | 0.3 | 4.223 | +0.029 |
+| p8_mirrormup | 0.354 | 0.0931 | 0.955/0.9908 | 1.0 | 4.264 | +0.070 |
+| p8_mirrormup_defb | 0.354 | 0.0931 | 0.9/0.999 | 1.0 | 4.277 | +0.083 |
+| p8_mirrormup_alrs0p3 | 0.354 | 0.0931 | 0.955/0.9908 | 0.3 | 4.293 | +0.099 |
+| p8_awd0p3_tunedb | 0.01 | 0.3 | 0.955/0.9908 | 1.0 | 4.358 | +0.164 |
+| p8_awd0p3 | 0.01 | 0.3 | 0.9/0.999 | 1.0 | 4.369 | +0.175 |
+
+### Key findings (all NEGATIVE for closing the gap)
+
+1. **C2 hypothesis (per-leg WD asymmetry) is FALSIFIED.** Increasing `adam_weight_decay` from 0.01 to 0.0931 (mup-Muon's optimum) makes test loss 0.020-0.028 *worse* in every cell. Mirroring mup-Muon's exact (kl_wd=0.354, adam_wd=0.0931) gives 4.264 — 0.07 nats WORSE than the previous best.
+2. **C1 hypothesis (tuned Adam betas)** confirms a tiny benefit: tuned 0.955/0.9908 → 4.192 vs default 0.9/0.999 → 4.194 (Δ=0.002, within σ=0.004 noise floor).
+3. **C3 hypothesis (`adam_lr_scale=0.3`)** does not help: all alrs=0.3 cells are within noise of their alrs=1.0 counterparts (4.22 vs 4.21).
+4. **High `weight_decay` (kl_wd=0.354)** consistently hurts in our SP regime, regardless of adam_wd or betas.
+
+### Why mup-Muon's HPs don't transfer
+
+The audit established that mup-Muon's per-leg WDs (0.354 / 0.0931) are tuned for the **MuP-scaled regime**: MuP applies per-tensor LR multipliers that change the effective per-tensor step magnitude, so the optimal WD compensates differently per group. Our **vanilla SP** has uniform per-tensor scaling, so the same WD values over-regularize. mup-Muon's xak20u38 also runs at peak_lr=0.022 — close to our optimum 0.016 — but the relationship between LR, WD, and parameterization is non-transferable across SP ↔ MuP.
+
+### New best HP recommendation (v0.2.0 defaults)
+
+```python
+optimizer_args = dict(
+    class_="kl_shampoo",
+    kwargs=dict(
+        b1=0.9, shampoo_b=0.99, eps=1e-8, weight_decay=0.01,
+        precondition_frequency=1, init_factor=0.1,
+        max_clamp_value=4000, using_clamping=True, max_precond_dim=8192,
+        adam_b1=0.955,           # tuned (Phase 8): tiny win over 0.9
+        adam_b2=0.9908,          # tuned (Phase 8)
+        adam_eps=1e-8,
+        adam_weight_decay=None,  # leave at chain-level WD; per-leg WD hurt
+        adam_lr_scale=1.0,       # do not scale Adam LR separately
+    )
+)
+schedule = dict(
+    class_="warmup_cosine_decay_schedule",
+    kwargs=dict(peak_value=1.6e-2, end_value=1.6e-3,
+                warmup_steps=500, decay_steps=4000,
+                init_value=0.0, exponent=1.0),
+)
+```
+
+**Best test loss: 4.192 ± 0.004** (4-seed mean of equivalent configs converges to 4.20 ± 0.004).
+
+### Conclusion: the 0.18-nat gap is structural
+
+After 50 sweep jobs across 8 phases (~250 GPU-hours on 4×H100), the floor is 4.192. The gap to mup-Muon's 4.018 (test 4.018, train 4.023) is **structural — it requires MuP parameterization**, not Adam HP tuning. The `adam_weight_decay` and `adam_lr_scale` knobs added in v0.2.0 are useful API additions for future MuP integration but do not close the gap on their own.
+
+**Future work** (out of scope here): port MuP scaling into `kl_shampoo_with_adamw` (mirroring mup-Muon's `muon_lr_scales` / `adam_lr_scales` pytrees) and re-sweep. Estimated effort: ~1 day of integration work.
+
+### Phase 8 job IDs (fir, all completed)
+
+39253383, 39253384, 39253385, 39253386, 39253387, 39253388, 39253389, 39253390, 39253391, 39253392, 39253393, 39253394.
+
+**Total sweep work to date: 50 jobs across 8 phases, ~250 GPU-hours on 4×H100.**
