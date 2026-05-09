@@ -47,23 +47,33 @@ def kl_shampoo_with_adamw(
     kl_kwargs: Optional[Mapping[str, Any]] = None,
     adamw_kwargs: Optional[Mapping[str, Any]] = None,
     weight_decay: float = 0.01,
+    adam_weight_decay: Optional[float] = None,
+    adam_lr_scale: float = 1.0,
     max_precond_dim: int = 8192,
 ) -> optax.GradientTransformation:
     """KL-Shampoo on 2D/3D in-range matrices, AdamW on the rest.
 
     Both legs share the same `learning_rate` schedule. Decoupled weight decay
-    is applied once at the chain level so it covers both groups uniformly.
+    can be applied uniformly across both legs (default) or asymmetrically,
+    matching mup-Muon's separate `weight_decay` (Muon group) and
+    `adam_weight_decay` (Adam group).
 
     The KL leg returns the *positive* preconditioned grad and the AdamW leg
     returns the standard Adam direction; the outer chain applies
-    `add_decayed_weights(weight_decay)` and `scale_by_learning_rate(lr)`,
-    which inserts the minus sign and the schedule.
+    `scale_by_learning_rate(lr)`, which inserts the minus sign and the schedule.
 
     Args:
       learning_rate: scalar or `optax.Schedule`. Shared across both legs.
       kl_kwargs: kwargs forwarded to `kl_shampoo` (b1, shampoo_b, eps, ...).
       adamw_kwargs: kwargs forwarded to `optax.scale_by_adam` (b1, b2, eps, ...).
-      weight_decay: decoupled-WD coefficient applied to all params.
+      weight_decay: decoupled-WD coefficient. If `adam_weight_decay` is None,
+        applied uniformly to all params at the chain level (legacy behaviour).
+        Otherwise, applied only to the KL leg.
+      adam_weight_decay: if not None, decoupled-WD coefficient applied only to
+        the AdamW leg. Mirrors mup-Muon's per-leg WD asymmetry.
+      adam_lr_scale: multiplicative LR scale applied to the AdamW leg only.
+        Useful when KL-Shampoo's optimal LR is much higher than the AdamW
+        leg's optimum (KL is matrix-preconditioned; AdamW is sign-magnitude).
       max_precond_dim: KL leg routes only tensors with `max(shape) <= this`.
     """
     kl_kwargs = dict(kl_kwargs or {})
@@ -72,18 +82,41 @@ def kl_shampoo_with_adamw(
     # it is unused there — the schedule is applied at the chain level.
     kl_kwargs.pop("learning_rate", None)
     adamw_kwargs.pop("learning_rate", None)
-    adamw_kwargs.pop("weight_decay", None)  # WD applied at chain level
+    adamw_kwargs.pop("weight_decay", None)
 
-    kl_leg = kl_shampoo(**kl_kwargs)
-    adam_leg = optax.scale_by_adam(**adamw_kwargs)
+    if adam_weight_decay is None:
+        # Legacy: single chain-level WD applied uniformly across both legs.
+        kl_leg = kl_shampoo(**kl_kwargs)
+        adam_leg = optax.scale_by_adam(**adamw_kwargs)
+        if adam_lr_scale != 1.0:
+            adam_leg = optax.chain(adam_leg, optax.scale(adam_lr_scale))
+        inner = optax.multi_transform(
+            {"kl": kl_leg, "adam": adam_leg},
+            param_labels(max_precond_dim=max_precond_dim),
+        )
+        return optax.chain(
+            inner,
+            optax.add_decayed_weights(weight_decay),
+            optax.scale_by_learning_rate(learning_rate),
+        )
 
+    # Per-leg WD: KL gets `weight_decay`, Adam gets `adam_weight_decay`.
+    # Critically, NO chain-level add_decayed_weights — that would double-count.
+    kl_leg = optax.chain(
+        kl_shampoo(**kl_kwargs),
+        optax.add_decayed_weights(weight_decay),
+    )
+    adam_leg = optax.chain(
+        optax.scale_by_adam(**adamw_kwargs),
+        optax.add_decayed_weights(adam_weight_decay),
+    )
+    if adam_lr_scale != 1.0:
+        adam_leg = optax.chain(adam_leg, optax.scale(adam_lr_scale))
     inner = optax.multi_transform(
         {"kl": kl_leg, "adam": adam_leg},
         param_labels(max_precond_dim=max_precond_dim),
     )
-
     return optax.chain(
         inner,
-        optax.add_decayed_weights(weight_decay),
         optax.scale_by_learning_rate(learning_rate),
     )
