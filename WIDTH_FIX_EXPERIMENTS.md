@@ -98,3 +98,60 @@ This zeroes out the width dependence by construction, no per-width tuning needed
 - 18 jobs × 25 min × ~3 concurrent ≈ 2.5h queue wall
 - Sync + aggregate + plot: 15 min
 - Total wall: ~3h
+
+---
+
+# Option B follow-up — full 12-LR sweep at w=1024 (2026-05-13)
+
+After the audit confirmed A5b (`init_factor=0.001` uniform global) recovers LR transfer, we implemented the **principled "Option B"** scaling from `kl_shampoo_init_section.tex`: `λ_k(0) ← ρ_0 / d_k` per factor, applied via a one-line edit at `kl_shampoo_jax/_core.py:101`. With ρ_0 = 1.0 (so λ_init = 1/d_k at every factor), we ran the same 12-LR Phase 7v2 grid at w=1024, distributed across rorqual + narval (fir partition was in maintenance — its jobs migrated to the other two clusters).
+
+## Result: Option B does NOT recover the LR optimum
+
+| LR | baseline init=0.1 | A5b init=0.001 | **Option B init=1/d** |
+|---|---|---|---|
+| 1.00e-5 | 7.97 | — | 8.32 |
+| 2.31e-5 | 7.02 | — | 7.13 |
+| 5.34e-5 | 6.00 | — | 6.11 |
+| 1.23e-4 | 5.07 | — | 5.20 |
+| 2.85e-4 | 4.34 | — | 4.47 |
+| 6.58e-4 | 3.79 | — | 3.88 |
+| 1.52e-3 | 3.58 | — | 3.61 |
+| **3.51e-3** | **3.527** ← best | 3.566 | **3.577** ← best |
+| 8.11e-3 | 3.59 | **3.562** ← best | 3.628 |
+| 1.87e-2 | 3.84 | — | 3.86 |
+| 4.33e-2 | 3.89 | — | 3.99 |
+| 1.00e-1 | 5.77 | — | 4.14 |
+
+**Key finding (12/12 grid LRs):** Option B's U-curve sits ~0.03-0.05 nats *above* the baseline across the whole sweep, with its **minimum at the same LR (3.51e-3)** as the baseline. It does NOT shift the optimum to base LR=8.11e-3 like A5b does. The "principled" per-factor scaling underperforms both the original `init_factor=0.1` baseline AND A5b's uniform-global `init_factor=0.001`.
+
+This **contradicts the prediction in `kl_shampoo_init_section.tex` §1.3**, which derived `λ_eq ~ Θ(1/d)` and argued matching init to that should recover transfer. The empirical result shows the mechanism is more nuanced: A5b's *uniform* small init works (every factor gets λ=0.001), but the per-factor `λ = 1/d` scaling does not. Possible reasons:
+
+1. **Small-factor over-amplification:** at small d_k (e.g. attention head intermediate dims), Option B gives larger init than A5b's uniform 0.001 (e.g. at d=256, Option B → 0.0039 vs A5b → 0.001). Over-amplification at small factors may degrade training.
+2. **Equilibrium scaling assumption wrong at d=4:** the audit derived `λ_eq ~ Θ(1/d)` under μP gradient variance, but the actual scaling at depth=4 may differ — d_eq could scale differently than the d in `1/d`.
+3. **Smaller-than-A5b at large factors:** at d=2816 (largest factor for MLP-down at w=1024), Option B → 3.6e-4, much smaller than A5b's 0.001. Possibly *too* small.
+
+## Implementation notes
+
+- Patch applied in-place via sed on `_core.py:101` (backup at `*.bak_optionB`):
+  ```
+  esi = jnp.full((d,), 1.0 / jnp.sqrt(init_factor / d), dtype=cast_dtype)
+  ```
+- Per-job override: `--cfg_options optimizer_args.kwargs.init_factor=1.0` (= ρ_0).
+- Patch reverted on rorqual + narval. **Fir patch remains pending** (SSH expired during fir's maintenance window; revert when fir returns).
+- Final figure: `figures/phase7v2_w1024_optb_full.{pdf,png}` (full range) + `..._zoom.{pdf,png}` (zoomed near optimum).
+
+## Cluster distribution
+
+- **Fir** (FS=0.41, planned 4 jobs): **partition went into maintenance** mid-experiment → jobs cancelled, 4 LRs migrated to rorqual+narval.
+- **Rorqual** (FS=0.40, 7 jobs total): 6 single-GPU H100 jobs + 1 in-flight 4-GPU bonus (5.41e-3 failed mid-training due to JAX coordination crash).
+- **Narval** (FS=0.36, 5 jobs A100): all 5 reached 100%; gRPC errors during post-training wandb cleanup but training data intact in offline-run dirs.
+
+## Verdict
+
+**A5b remains the only verified recovery mechanism**, even though its mechanism is harder to motivate theoretically. The principled per-factor scaling fails empirically. The next test (not run here) should be **Option A (data-driven init from first-batch GG)** which is what the audit originally recommended; it would test whether the right init is the *actual* GG diagonal vs any fixed analytical form.
+
+## Pending work
+
+1. **Revert** `fir:_core.py` when fir's SSH is restored (`*.bak_optionB` exists; one-line `cp` restore).
+2. **Update `kl_shampoo_init_section.tex`** Table 1 and §1.3 — current draft over-promises Option B; replace with empirical finding + open question on Option A.
+3. **(Optional) Test Option A** — data-driven init from first-batch GG diagonal. ~3 GPU-hours.
