@@ -210,6 +210,78 @@ across an $8\times$ width range (Phase~7v2 sweep, see
 Sec.~\ref{sec:width-transfer-results} or
 \texttt{PHASE7V2\_REPORT.md} in the supplementary material).
 
+\paragraph{Tying back to the actual weight update.}
+The eigenvalue-equilibrium argument above is only meaningful insofar as
+it shows up in the optimizer's actual weight update. The KL-Shampoo
+update (Algorithm~\ref{alg:klshampoo}, line~11) in matrix form is
+$\Delta W = -\gamma\, S_a^{-1/2}\, M\, S_b^{-1/2}$ with
+$S_k = Q_k\,\mathrm{diag}(\lambda_k)\,Q_k^\top$. When $\lambda_k$ is
+\emph{uniform within each factor} (every eigenvalue at the same value
+$\rho_k$), $S_k = \rho_k\,Q_k Q_k^\top = \rho_k\,I$ and
+$S_k^{-1/2} = (1/\sqrt{\rho_k})\,I$, so the eigenbasis $Q$ \emph{cancels
+entirely}:
+\begin{equation}
+\Delta W_{(1)} \;=\; -\frac{\gamma}{\sqrt{\rho_a\,\rho_b}}\,G_1
+\label{eq:step1-update}
+\end{equation}
+at step~1 (with $M{=}G_1$). The spectral machinery contributes nothing
+until the eigenvalue EMA has seen enough batches to make $\lambda_k$
+non-uniform. Crucially, this means both the original $\rho{=}0.1$ and
+the uniform A5b $\rho{=}0.001$ act as \emph{scalar} preconditioners of
+strength $1/\rho$ on the very first step, regardless of the basis~$Q$.
+
+Comparing the three configurations on a fixed MLP-up matrix
+($d_a, d_b$):
+\begin{center}
+\small
+\begin{tabular}{l c c c c}
+\toprule
+Config & $\rho_a$ & $\rho_b$ & $1/\!\sqrt{\rho_a\rho_b}$
+       & Width-dependent at fixed $\gamma$? \\
+\midrule
+baseline ($\rho{=}0.1$) & $0.1$ & $0.1$ & $10$ & \textbf{no} (constant) \\
+A5b ($\rho{=}0.001$) & $10^{-3}$ & $10^{-3}$ & $1000$ & \textbf{no} (constant) \\
+Option~B ($\rho_0/d_k$, $\rho_0{=}1$) & $1/d_a$ & $1/d_b$ & $\sqrt{d_a d_b}$ & \textbf{yes} ($\propto\!\!\sqrt{d_a d_b}$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{For both A5b and baseline, the step-1 weight update is
+width-invariant at fixed $\gamma$ --- their first step is $10\gamma G_1$
+or $1000\gamma G_1$ at every width.} Option~B, by contrast, makes the
+step grow as $\sqrt{d_a d_b}$: $\sqrt{256\cdot 704}{=}424\gamma G_1$ at
+$w{=}256$ versus $\sqrt{1024\cdot 2816}{=}1697\gamma G_1$ at $w{=}1024$
+--- a $4\!\times$ growth per $4\!\times$ width increase. \emph{This is
+an explicit $\mu$P violation introduced by Option~B in the init regime:}
+Qiu's prescription is $\eta\!\propto\!\sqrt{d_\mathrm{out}/d_\mathrm{in}}$
+which is $\Theta(1)$ for square layers and constant in width for MLP
+up/down, but Option~B's effective step-size includes a spurious
+$\sqrt{d_a d_b}$ factor. So Option~B does not just \emph{fail} to fix
+the drift; it actively breaks $\mu$P during the wake-up phase, in a
+direction that hurts.
+
+\paragraph{What actually causes the baseline drift.}
+Since baseline's step-1 update is width-invariant
+(Eq.~\eqref{eq:step1-update} gives the same scalar $1/\sqrt{\rho^2}{=}10$
+at every width), the LR-optimum drift \emph{cannot} be attributed to a
+step-1 magnitude mismatch. The mechanism is the \emph{ramp} between
+step~1 and equilibrium: as the EMA pulls $\lambda_k$ down from $\rho$ to
+$\lambda_k^\star\!\sim\! 1/d_a$, the effective scalar preconditioner
+$1/\sqrt{\rho_a\rho_b}{\to}1/\sqrt{\lambda_a^\star \lambda_b^\star}\!\sim\!
+d_a$ for a square layer. For baseline at $w{=}1024$ this scalar goes
+$10{\to}1024$ (a $100\!\times$ jump) over the first
+$\tau_\mathrm{eq}\!\approx\!100$ steps; at $w{=}256$ it goes $10{\to}256$
+(only $25\!\times$). The width-dependent quantity is therefore the
+\emph{ramp-to-equilibrium ratio} $\rho \cdot d_a$, not the step-1
+magnitude itself. A peak~$\gamma$ tuned to the equilibrium phase
+encounters a larger mid-warmup transition at wider widths, risking
+overshoot, which forces the optimum~$\gamma$ downward. A5b removes the
+ramp by choosing $\rho\!\approx\!\lambda^\star$ at the model's dominant
+layers ($1/\rho{=}10^3 \approx d_a{=}10^3$ at $w{=}1024$).
+Strictly, neither A5b nor baseline violates $\mu$P asymptotically --- both
+converge to the same equilibrium preconditioner. The LR-drift is an
+``effective-LR'' artefact of the bounded transient, not an asymptotic
+$\mu$P violation.
+
 \subsection{Fix: make the initialization width-aware}
 \label{sec:klshampoo-init-fix}
 
